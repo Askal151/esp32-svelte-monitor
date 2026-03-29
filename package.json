@@ -1,0 +1,22 @@
+{
+  "name": "esp32-hall-monitor",
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview --host --port 5173"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^3.1.2",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "svelte": "^4.2.18",
+    "tailwindcss": "^3.4.15",
+    "vite": "^5.3.4"
+  },
+  "dependencies": {
+    "esptool-js": "^0.6.0",
+    "uplot": "^1.6.31"
+  }
+}
