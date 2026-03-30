@@ -25,7 +25,7 @@
 
   function classify(t) {
     if (!t) return 'default';
-    if (t.startsWith('HALL2|'))  return 'data';
+    if (t.startsWith('HALL4|'))  return 'data';
     if (t.startsWith('>> '))     return 'tx';
     if (t.startsWith('[USB]'))   return 'usb';
     if (t.startsWith('[SISTEM]')) return 'sys';
@@ -44,7 +44,7 @@
   let dispLines = [];
   let total     = 0;
   let filterTxt = '';
-  let showData  = true;   // tunjuk HALL2 data secara lalai
+  let showData  = true;   // tunjuk HALL4 data secara lalai
   let autoScroll = true;
   let scrollY   = 0;
   let dragAnchor = null, dragScrollStart = 0;
@@ -221,7 +221,7 @@
     <span class="text-xs font-bold tracking-widest text-slate-600">SERIAL</span>
     <label class="flex items-center gap-1 text-xs text-slate-600 cursor-pointer select-none">
       <input type="checkbox" bind:checked={showData} class="accent-cyan-500" />
-      HALL2
+      HALL4
     </label>
     <div class="relative flex-1 min-w-16 max-w-48">
       <input
@@ -264,7 +264,7 @@
     <input
       class="flex-1 bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-xs text-green-400 font-mono outline-none focus:border-slate-600 caret-green-400 placeholder:text-slate-800"
       bind:value={cmdInput}
-      placeholder="Taip perintah (a/b/c/d/s/r) + Enter"
+      placeholder="Perintah: a/b/e/f=AUTO cal | c/d/g/h=baseline | s=status | r=reset"
       spellcheck="false"
       autocomplete="off"
     />

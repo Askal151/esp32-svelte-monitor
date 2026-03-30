@@ -1,7 +1,7 @@
 /**
  * serial.js — Web Serial manager untuk ESP32 + ADS1015
  * Format output: HALL4|adc1|dev1|led1|adc2|dev2|led2|adc3|dev3|led3|adc4|dev4|led4  @115200
- * S1=A0, S2=A1, S3=A2 (SS49E_1), S4=A3 (SS49E_2)
+ * S1=A0, S2=A1, S3=A2, S4=A3
  */
 import { writable } from 'svelte/store';
 
@@ -49,45 +49,88 @@ function emitRaw(text, dir = 'rx') {
 
 // ── Regex ──────────────────────────────────────────────────────
 const RX_DATA = /HALL4\|(-?\d+)\|(-?\d+)\|(-?\d+)\|(-?\d+)\|(-?\d+)\|(-?\d+)\|(-?\d+)\|(-?\d+)\|(-?\d+)\|(-?\d+)\|(-?\d+)\|(-?\d+)/;
-const RX_THR1 = /\[THRESH1\]\s*(\d+)\|(\d+)\|(\d+)\|(\d+)/;
-const RX_THR2 = /\[THRESH2\]\s*(\d+)\|(\d+)\|(\d+)\|(\d+)/;
-const RX_THR3 = /\[THRESH3\]\s*(\d+)\|(\d+)\|(\d+)\|(\d+)/;
-const RX_THR4 = /\[THRESH4\]\s*(\d+)\|(\d+)\|(\d+)\|(\d+)/;
+const RX_THR  = [1,2,3,4].map(i => new RegExp(`\\[THRESH${i}\\]\\s*(\\d+)\\|(\\d+)\\|(\\d+)\\|(\\d+)`));
 const RX_BASE = /\[(?:AUTO|CAL|INIT)\s*S(\d)\].*?(\d+)\s*$/;
 
 // ── State ──────────────────────────────────────────────────────
-let _port      = null;
-let _reader    = null;
-let _running   = false;
-let _lineBuf   = '';
-let _csvRows   = [];
-let _logging   = false;
-let _logCount  = 0;
-let _wantMonitor   = false;   // adakah user mahu monitor aktif?
-let _reconnecting  = false;   // cegah race condition reconnect berganda
+let _port         = null;
+let _reader       = null;
+let _running      = false;
+let _lineBuf      = '';
+let _csvRows      = [];
+let _logging      = false;
+let _logCount     = 0;
+let _wantMonitor  = false;
+let _reconnecting = false;
+let _watchdog     = null;
+
+const WATCHDOG_MS  = 6000;   // 6s tiada data → reconnect
+const BAUD         = 115200;
+const BUF_SIZE     = 65536;  // buffer besar cegah overflow
 
 isLogging.subscribe(v => { _logging = v; });
 
-// ── Web Serial disconnect/connect events ───────────────────────
+// ── Watchdog ───────────────────────────────────────────────────
+function resetWatchdog() {
+  clearTimeout(_watchdog);
+  if (_running && _wantMonitor) {
+    _watchdog = setTimeout(onWatchdogFire, WATCHDOG_MS);
+  }
+}
+
+function stopWatchdog() {
+  clearTimeout(_watchdog);
+  _watchdog = null;
+}
+
+async function onWatchdogFire() {
+  if (!_running || !_wantMonitor || _reconnecting) return;
+  console.warn('[serial] watchdog — tiada data, reconnect...');
+  emitRaw('[WATCHDOG] Tiada data — cuba sambung semula...', 'rx');
+  await _forceReconnect();
+}
+
+// ── Tutup reader & port dengan selamat ─────────────────────────
+async function _closeAll() {
+  stopWatchdog();
+  _running = false;
+  try { await _reader?.cancel(); }   catch {}
+  try { _reader?.releaseLock(); }    catch {}
+  _reader = null;
+  await delay(100);
+  try { await _port?.close(); }      catch {}
+}
+
+// ── Force reconnect (tutup dulu, buka semula) ──────────────────
+async function _forceReconnect() {
+  const savedPort = _port;
+  connected.set(false);
+  await _closeAll();
+  _port = savedPort;            // simpan port reference
+  if (_port) {
+    await delay(600);
+    await _autoReconnect();
+  }
+}
+
+// ── Web Serial USB events ──────────────────────────────────────
 if (typeof navigator !== 'undefined' && navigator.serial) {
   navigator.serial.addEventListener('disconnect', (e) => {
-    if (e.target === _port) {
-      console.log('[serial] USB disconnect event');
-      _running  = false;
-      connected.set(false);
-      emitRaw('[USB] Peranti terputus — menunggu sambungan semula...', 'rx');
-      try { _reader?.releaseLock(); } catch {}
-      _reader = null;
-      // Port tidak sah lagi selepas USB disconnect
-      _port = null;
-    }
+    if (e.target !== _port) return;
+    console.log('[serial] USB disconnect');
+    stopWatchdog();
+    _running = false;
+    _port    = null;
+    connected.set(false);
+    emitRaw('[USB] Peranti terputus — menunggu sambungan semula...', 'rx');
+    try { _reader?.releaseLock(); } catch {}
+    _reader = null;
   });
 
-  navigator.serial.addEventListener('connect', async (e) => {
+  navigator.serial.addEventListener('connect', async () => {
     if (_wantMonitor && !_running && !_reconnecting) {
-      console.log('[serial] USB connect event — reconnecting...');
-      emitRaw('[USB] Peranti disambung semula — reconnecting...', 'rx');
-      await delay(600);
+      emitRaw('[USB] Peranti dikesan — reconnecting...', 'rx');
+      await delay(800);
       await _autoReconnect();
     }
   });
@@ -101,7 +144,7 @@ function parseLine(raw) {
 
   let m = RX_DATA.exec(line);
   if (m) {
-    const v = [1,2,3,4,5,6,7,8,9,10,11,12].map(i => +m[i]);
+    const v = Array.from({ length: 12 }, (_, i) => +m[i + 1]);
     sensors.update(arr => {
       for (let i = 0; i < 4; i++) {
         const adc = v[i*3], dev = v[i*3+1], led = v[i*3+2];
@@ -114,6 +157,7 @@ function parseLine(raw) {
     });
     packetCount.update(n => n + 1);
     chartTick.update(n => n + 1);
+    resetWatchdog();   // data diterima — reset timer
     if (_logging) {
       _csvRows.push([new Date().toISOString().slice(11, 23), ...v].join(','));
       logCount.set(++_logCount);
@@ -121,18 +165,20 @@ function parseLine(raw) {
     return;
   }
 
-  m = RX_THR1.exec(line);
-  if (m) { const t = [1,2,3,4].map(i=>+m[i]); sensors.update(a=>{a[0]={...a[0],thresh:t};return a;}); return; }
-  m = RX_THR2.exec(line);
-  if (m) { const t = [1,2,3,4].map(i=>+m[i]); sensors.update(a=>{a[1]={...a[1],thresh:t};return a;}); return; }
-  m = RX_THR3.exec(line);
-  if (m) { const t = [1,2,3,4].map(i=>+m[i]); sensors.update(a=>{a[2]={...a[2],thresh:t};return a;}); return; }
-  m = RX_THR4.exec(line);
-  if (m) { const t = [1,2,3,4].map(i=>+m[i]); sensors.update(a=>{a[3]={...a[3],thresh:t};return a;}); return; }
+  for (let i = 0; i < 4; i++) {
+    m = RX_THR[i].exec(line);
+    if (m) {
+      const t = [1,2,3,4].map(j => +m[j]);
+      sensors.update(a => { a[i] = { ...a[i], thresh: t }; return a; });
+      return;
+    }
+  }
+
   m = RX_BASE.exec(line);
   if (m) {
     const idx = +m[1] - 1, base = +m[2];
-    sensors.update(a => { a[idx] = { ...a[idx], baseline: base }; return a; });
+    if (idx >= 0 && idx < 4)
+      sensors.update(a => { a[idx] = { ...a[idx], baseline: base }; return a; });
   }
 }
 
@@ -156,64 +202,58 @@ async function readLoop() {
     }
   }
 
-  // Putus secara tidak sengaja (bukan oleh disconnect())
-  if (_running && _wantMonitor && !_reconnecting) {
-    _running = false;
-    connected.set(false);
-    emitRaw('[SISTEM] Sambungan hilang — tunggu USB...', 'rx');
-    try { _reader?.releaseLock(); } catch {}
-    _reader = null;
-    // Jika port masih ada (bukan USB disconnect), cuba tutup & buka semula
-    if (_port) {
-      try { await _port.close(); } catch {}
-      await delay(800);
-      await _autoReconnect();
-    }
-    // Jika port tiada, tunggu 'connect' event dari navigator.serial
-  }
-
   console.log('[serial] readLoop berhenti');
+
+  // Putus tidak sengaja — cuba reconnect
+  if (_running && _wantMonitor && !_reconnecting) {
+    emitRaw('[SISTEM] Sambungan hilang — cuba pulihkan...', 'rx');
+    await _forceReconnect();
+  }
 }
 
-// ── Auto reconnect (guna getPorts untuk port yang sama) ────────
+// ── Auto reconnect ─────────────────────────────────────────────
 async function _autoReconnect() {
-  if (_reconnecting) return;   // cegah panggilan berganda
+  if (_reconnecting) return;
   _reconnecting = true;
-  for (let attempt = 1; attempt <= 10; attempt++) {
+  portState.set('idle');
+
+  for (let attempt = 1; attempt <= 12; attempt++) {
+    if (!_wantMonitor) break;
     try {
-      // Guna getPorts() — tidak perlukan user gesture
       const ports = await navigator.serial.getPorts();
       if (!ports.length) {
-        emitRaw(`[USB] Tiada port — tunggu... (${attempt}/10)`, 'rx');
+        emitRaw(`[USB] Tiada port tersedia... (${attempt}/12)`, 'rx');
         await delay(1000);
         continue;
       }
       _port = ports[0];
 
-      // Pastikan port tertutup dulu
+      // Pastikan port tertutup — jangan assume state
       try { await _port.close(); } catch {}
-      await delay(200);
+      await delay(300);
 
-      await _port.open({ baudRate: 115200 });
+      await _port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
       _reader  = _port.readable.getReader();
       _running = true;
       connected.set(true);
       portState.set('monitor');
-      emitRaw('[USB] Sambungan dipulihkan ✓', 'rx');
+      emitRaw(`[USB] Sambungan dipulihkan ✓ (percubaan ${attempt})`, 'rx');
       console.log('[serial] reconnect berjaya (attempt', attempt, ')');
       _reconnecting = false;
+      resetWatchdog();
       readLoop();
       return;
     } catch (e) {
       console.warn(`[serial] reconnect ${attempt} gagal:`, e.message);
-      await delay(1000);
+      await delay(Math.min(1000 * attempt, 5000));   // backoff
     }
   }
+
   _reconnecting = false;
+  _wantMonitor  = false;
+  _port = null;
   emitRaw('[SISTEM] Reconnect gagal — klik ⚡ Sambung semula', 'rx');
   portState.set('idle');
-  _port = null;
-  _wantMonitor = false;
 }
 
 // ── API awam ───────────────────────────────────────────────────
@@ -223,30 +263,28 @@ export async function connect() {
     alert('Web Serial API tidak disokong. Sila guna Chrome atau Edge.');
     return false;
   }
+
+  // Bersihkan sambungan lama dulu
+  if (_running || _port) {
+    await _closeAll();
+    _port = null;
+    await delay(200);
+  }
+
   try {
     _port = await navigator.serial.requestPort();
-    console.log('[serial] port dipilih, membuka...');
-
-    // Tutup dulu kalau masih open dari sesi lama
-    if (_port.readable) {
-      try { await _port.close(); } catch {}
-      await delay(300);
-    }
-
-    await _port.open({ baudRate: 115200 });
-    console.log('[serial] port dibuka');
+    await _port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
 
     _reader      = _port.readable.getReader();
     _running     = true;
     _wantMonitor = true;
     connected.set(true);
     portState.set('monitor');
+    resetWatchdog();
     readLoop();
     return true;
   } catch (e) {
-    if (e.name !== 'NotFoundError') {
-      console.error('[serial] gagal sambung:', e);
-    }
+    if (e.name !== 'NotFoundError') console.error('[serial] gagal sambung:', e);
     _port = null;
     throw e;
   }
@@ -254,12 +292,7 @@ export async function connect() {
 
 export async function disconnect() {
   _wantMonitor = false;
-  _running     = false;
-  try { await _reader?.cancel(); }  catch {}
-  try { _reader?.releaseLock(); }   catch {}
-  _reader = null;
-  await delay(150);
-  try { await _port?.close(); }     catch {}
+  await _closeAll();
   _port = null;
   connected.set(false);
   portState.set('idle');
@@ -267,30 +300,25 @@ export async function disconnect() {
 }
 
 export async function sendCmd(cmd) {
-  if (!_port?.writable) return;
+  if (!_port?.writable || _port.writable.locked) return;
   const w = _port.writable.getWriter();
   try {
     await w.write(new TextEncoder().encode(cmd));
     emitRaw(`>> ${cmd}`, 'tx');
-  } finally { w.releaseLock(); }
+  } catch (e) {
+    console.warn('[serial] sendCmd gagal:', e.message);
+  } finally {
+    w.releaseLock();
+  }
 }
 
 // ── Flash API ──────────────────────────────────────────────────
 export async function prepareForFlash() {
   if (!navigator.serial) throw new Error('Web Serial API tidak disokong.');
   _wantMonitor = false;
-  if (_running) {
-    _running = false;
-    try { await _reader?.cancel(); }  catch {}
-    try { _reader?.releaseLock(); }   catch {}
-    _reader = null;
-    await delay(200);
-    try { await _port?.close(); }     catch {}
-    connected.set(false);
-  } else if (!_port) {
+  await _closeAll();
+  if (!_port) {
     _port = await navigator.serial.requestPort();
-  } else {
-    try { await _port?.close(); }     catch {}
   }
   await delay(400);
   portState.set('flashing');
@@ -301,13 +329,14 @@ export async function resumeMonitor() {
   portState.set('idle');
   if (!_port) return;
   try {
-    await delay(300);
-    await _port.open({ baudRate: 115200 });
+    await delay(400);
+    await _port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
     _reader      = _port.readable.getReader();
     _running     = true;
     _wantMonitor = true;
     connected.set(true);
     portState.set('monitor');
+    resetWatchdog();
     readLoop();
   } catch (e) {
     console.error('[resumeMonitor]', e.message);
@@ -317,8 +346,9 @@ export async function resumeMonitor() {
 }
 
 export function forgetPort() {
-  _port = null;
   _wantMonitor = false;
+  stopWatchdog();
+  _port = null;
   portState.set('idle');
   connected.set(false);
 }
