@@ -103,28 +103,26 @@ async function _closeAll() {
 
 // ── Force reconnect (tutup dulu, buka semula) ──────────────────
 async function _forceReconnect() {
-  const savedPort = _port;
+  if (_reconnecting) return;    // cegah panggilan berganda
   connected.set(false);
   await _closeAll();
-  _port = savedPort;            // simpan port reference
-  if (_port) {
-    await delay(600);
-    await _autoReconnect();
-  }
+  await delay(600);
+  await _autoReconnect();
 }
 
 // ── Web Serial USB events ──────────────────────────────────────
 if (typeof navigator !== 'undefined' && navigator.serial) {
   navigator.serial.addEventListener('disconnect', (e) => {
     if (e.target !== _port) return;
-    console.log('[serial] USB disconnect');
+    console.log('[serial] USB disconnect event');
     stopWatchdog();
-    _running = false;
+    _running = false;   // hentikan readLoop — ia akan kesan physicalLoss sendiri
     _port    = null;
     connected.set(false);
-    emitRaw('[USB] Peranti terputus — menunggu sambungan semula...', 'rx');
+    try { _reader?.cancel(); } catch {}
     try { _reader?.releaseLock(); } catch {}
     _reader = null;
+    emitRaw('[USB] Peranti dicabut — cabut & pasang semula USB...', 'rx');
   });
 
   navigator.serial.addEventListener('connect', async () => {
@@ -182,10 +180,19 @@ function parseLine(raw) {
   }
 }
 
+// ── Kesan error USB hilang fizikal ─────────────────────────────
+function isPhysicalLoss(err) {
+  const msg = err?.message ?? '';
+  return msg.includes('device has been lost') ||
+         msg.includes('The device') ||
+         err?.name === 'NetworkError';
+}
+
 // ── Read loop ──────────────────────────────────────────────────
 async function readLoop() {
   const dec = new TextDecoder();
   _lineBuf = '';
+  let physicalLoss = false;
   console.log('[serial] readLoop mula');
 
   while (_running) {
@@ -197,15 +204,31 @@ async function readLoop() {
       _lineBuf = lines.pop() ?? '';
       for (const l of lines) parseLine(l);
     } catch (err) {
-      if (_running) console.warn('[serial] read error:', err.message);
+      console.warn('[serial] read error:', err.message);
+      physicalLoss = isPhysicalLoss(err);
       break;
     }
   }
 
   console.log('[serial] readLoop berhenti');
+  stopWatchdog();
 
-  // Putus tidak sengaja — cuba reconnect
+  if (physicalLoss) {
+    // USB hilang fizikal — bersih sahaja, JANGAN reconnect sekarang
+    // Tunggu navigator.serial 'connect' event untuk reconnect
+    _running = false;
+    _port    = null;
+    connected.set(false);
+    try { _reader?.releaseLock(); } catch {}
+    _reader = null;
+    emitRaw('[USB] Peranti hilang — cabut & pasang semula USB...', 'rx');
+    return;
+  }
+
+  // Putus tidak sengaja (bukan USB hilang) — boleh cuba reconnect
   if (_running && _wantMonitor && !_reconnecting) {
+    _running = false;
+    connected.set(false);
     emitRaw('[SISTEM] Sambungan hilang — cuba pulihkan...', 'rx');
     await _forceReconnect();
   }
