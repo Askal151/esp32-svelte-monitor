@@ -92,7 +92,7 @@
   <!-- ── SENSOR CARDS ────────────────────────────────── -->
   <section class="grid grid-cols-2 lg:grid-cols-4 gap-3 max-sm:grid-cols-1">
     {#each $sensors as s, i}
-      <SensorCard sensor={s} idx={i} color={CLR[i]} />
+      <SensorCard sensor={s} idx={i} color={CLR[i]} connected={$connected} onCmd={sendCmd} />
     {/each}
   </section>
 

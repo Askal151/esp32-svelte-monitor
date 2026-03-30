@@ -2,11 +2,35 @@
   SensorCard.svelte — Paparan data satu sensor Hall
 -->
 <script>
-  export let sensor = { adc: 0, volt: 0, dev: 0, led: 0, baseline: 0, thresh: [] };
-  export let idx    = 0;
-  export let color  = '#22d3ee';
+  export let sensor    = { adc: 0, volt: 0, dev: 0, led: 0, baseline: 0, thresh: [] };
+  export let idx       = 0;
+  export let color     = '#22d3ee';
+  export let connected = false;
+  export let onCmd     = async (_cmd) => {};
 
   const LED_COLORS = ['#f59e0b', '#f97316', '#ef4444', '#8b5cf6'];
+
+  // Perintah per sensor: [auto, baseline]
+  const CMDS = [['a','c'], ['b','d'], ['e','g'], ['f','h']];
+
+  let calMsg = '';
+  let calTimer = null;
+
+  function showMsg(msg) {
+    calMsg = msg;
+    clearTimeout(calTimer);
+    calTimer = setTimeout(() => calMsg = '', 6000);
+  }
+
+  async function doAuto() {
+    await onCmd(CMDS[idx][0]);
+    showMsg('Jauhkan magnet 2s, kemudian dekatkan 3s...');
+  }
+
+  async function doBaseline() {
+    await onCmd(CMDS[idx][1]);
+    showMsg('Jauhkan magnet 2s...');
+  }
 </script>
 
 <div class="card p-4 flex flex-col gap-3">
@@ -58,4 +82,29 @@
       {/each}
     </div>
   </div>
+
+  <!-- Butang Kalibrasi -->
+  <div class="flex gap-2 pt-1 border-t border-slate-800">
+    <button
+      class="flex-1 py-1.5 rounded text-xs font-bold transition-colors
+        {connected ? 'bg-violet-950 border border-violet-900 text-violet-400 hover:bg-violet-900' : 'bg-slate-900 border border-slate-800 text-slate-700 cursor-not-allowed'}"
+      disabled={!connected}
+      on:click={doAuto}
+      title="AUTO kalibrasi — [{CMDS[idx][0].toUpperCase()}]"
+    >⚡ AUTO Cal</button>
+    <button
+      class="flex-1 py-1.5 rounded text-xs font-bold transition-colors
+        {connected ? 'bg-blue-950 border border-blue-900 text-blue-400 hover:bg-blue-900' : 'bg-slate-900 border border-slate-800 text-slate-700 cursor-not-allowed'}"
+      disabled={!connected}
+      on:click={doBaseline}
+      title="Set baseline — [{CMDS[idx][1].toUpperCase()}]"
+    >⟳ Baseline</button>
+  </div>
+
+  <!-- Status kalibrasi -->
+  {#if calMsg}
+    <div class="text-xs text-yellow-400 bg-yellow-950 border border-yellow-900 rounded px-2 py-1 leading-snug">
+      {calMsg}
+    </div>
+  {/if}
 </div>
