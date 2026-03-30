@@ -260,8 +260,9 @@ async function _autoReconnect() {
         continue;
       }
       _port = ports[0];
+      // Tutup dulu — port mungkin masih terbuka dalam Chrome
       try { await _port.close(); } catch {}
-      await delay(400);
+      await delay(500);
 
       await _port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
       _reader = _port.readable.getReader();
@@ -314,6 +315,13 @@ export async function connect() {
 
   try {
     _port = await navigator.serial.requestPort();
+
+    // Port mungkin masih "open" dalam Chrome — cuba tutup dulu
+    if (_port.readable || _port.writable) {
+      try { await _port.close(); } catch {}
+      await delay(300);
+    }
+
     await _port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
 
     _reader      = _port.readable.getReader();
@@ -326,6 +334,8 @@ export async function connect() {
     return true;
   } catch (e) {
     if (e.name !== 'NotFoundError') console.error('[serial] gagal sambung:', e);
+    // Cuba tutup port jika open() gagal, supaya percubaan seterusnya bersih
+    try { await _port?.close(); } catch {}
     _port = null;
     throw e;
   }
