@@ -66,7 +66,6 @@ let _watchdog     = null;
 
 const WATCHDOG_MS = 6000;
 const BAUD        = 115200;
-const BUF_SIZE    = 65536;
 const MAX_STREAK  = 3;       // gagal >= MAX_STREAK → minta reconnect manual
 
 isLogging.subscribe(v => { _logging = v; });
@@ -98,32 +97,95 @@ async function onWatchdogFire() {
 // ── Tutup reader & port dengan selamat ─────────────────────────
 async function _safeClose() {
   stopWatchdog();
-  // Cancel dulu — ini unlock readable stream
+  // Cancel reader dulu — ini unlock readable stream
   try { await _reader?.cancel(); }  catch {}
   try { _reader?.releaseLock(); }   catch {}
   _reader = null;
-  await delay(150);   // beri masa Chrome release lock
+  await delay(200);   // beri masa Chrome release lock
+  // Pastikan readable tidak ada lock lain sebelum close
+  if (_port?.readable && !_port.readable.locked) {
+    try {
+      const r = _port.readable.getReader();
+      await r.cancel().catch(() => {});
+      r.releaseLock();
+    } catch {}
+    await delay(100);
+  }
   try { await _port?.close(); }     catch {}
-  await delay(100);
+  await delay(150);
 }
 
-// ── Buka port dengan retry jika port dalam state lama ──────────
-async function _openPort(port) {
-  for (let i = 0; i < 3; i++) {
+// ── Paksa unlock semua stream dan tutup port ───────────────────
+async function _forceClosePort(port) {
+  // Unlock readable — tangani sama ada locked atau tidak
+  if (port.readable) {
+    if (!port.readable.locked) {
+      // Bukan locked tapi port nampak terbuka — ambil reader lalu cancel
+      try {
+        const r = port.readable.getReader();
+        await r.cancel().catch(() => {});
+        r.releaseLock();
+      } catch {}
+    }
+    // Jika masih locked (reader lain pegang) — biarkan sahaja, close() akan handle
+  }
+  // Unlock writable
+  if (port.writable?.locked) {
     try {
-      await port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
+      // Kita tidak boleh paksa release writer orang lain — tapi cuba dapatkan writer baru akan gagal
+      // Cuma log dan teruskan
+      console.warn('[serial] writable masih locked semasa _forceClosePort');
+    } catch {}
+  }
+  await delay(200);
+  try { await port.close(); } catch (e) {
+    console.warn('[serial] _forceClosePort → close() gagal (mungkin sudah tertutup):', e.message);
+  }
+  await delay(200);
+}
+
+// ── Buka port — cuba pelbagai konfigurasi, force-close jika perlu ──
+async function _openPort(port) {
+  // Konfigurasi yang dicuba secara berurutan
+  // bufferSize kecil (4096) lebih selamat di Linux Chrome; tanpa bufferSize guna default Chrome
+  const OPEN_CONFIGS = [
+    { baudRate: BAUD, bufferSize: 4096 },
+    { baudRate: BAUD },
+  ];
+
+  // Jika port.readable bukan null → port sudah terbuka (dari sesi sebelum)
+  // Paksa tutup dulu sebelum buka semula
+  if (port.readable !== null) {
+    console.log('[serial] port nampak terbuka dari sesi lama — paksa tutup');
+    await _forceClosePort(port);
+  }
+
+  let lastErr = null;
+  for (const cfg of OPEN_CONFIGS) {
+    try {
+      await port.open(cfg);
+      console.log('[serial] port berjaya dibuka:', JSON.stringify(cfg));
       return;   // berjaya
     } catch (e) {
-      console.warn(`[serial] open attempt ${i+1} gagal:`, e.message);
-      if (i < 2) {
-        // Port mungkin masih open — paksa tutup dan cuba lagi
-        try { await port.close(); } catch {}
-        await delay(400 + i * 300);
-      } else {
-        throw new Error('Port tidak boleh dibuka. Reload halaman (Ctrl+Shift+R) dan cuba semula.');
-      }
+      lastErr = e;
+      console.warn(`[serial] open gagal (${JSON.stringify(cfg)}):`, e.message);
+      // Jika gagal, cuba force close lagi sebelum konfigurasi seterusnya
+      await _forceClosePort(port);
     }
   }
+
+  // Semua konfigurasi gagal — forget port supaya Chrome reset state sepenuhnya
+  if (typeof port.forget === 'function') {
+    console.warn('[serial] port.forget() — Chrome akan reset state port');
+    try { await port.forget(); } catch {}
+  }
+
+  const hint = lastErr?.message?.toLowerCase().includes('failed to open')
+    ? ' Pastikan tiada program lain (PlatformIO monitor, minicom) sedang menggunakan port ini.'
+    : '';
+  throw new Error(
+    `Gagal buka port: ${lastErr?.message ?? 'ralat tidak diketahui'}.${hint} Klik ⚡ Sambung dan pilih port sekali lagi.`
+  );
 }
 
 // ── Web Serial USB events ──────────────────────────────────────
@@ -330,6 +392,17 @@ export async function connect() {
     await delay(200);
   }
 
+  // Bersihkan sebarang port lama yang Chrome ingat — elak "port already open" dari sesi lama
+  try {
+    const stalePorts = await navigator.serial.getPorts();
+    for (const p of stalePorts) {
+      if (p.readable !== null) {
+        console.log('[serial] tutup stale port dari getPorts()');
+        await _forceClosePort(p).catch(() => {});
+      }
+    }
+  } catch {}
+
   try {
     _port = await navigator.serial.requestPort();
     await _openPort(_port);
@@ -344,9 +417,11 @@ export async function connect() {
     return true;
   } catch (e) {
     if (e.name !== 'NotFoundError') console.error('[serial] gagal sambung:', e);
-    // Cuba tutup port jika open() gagal, supaya percubaan seterusnya bersih
-    try { await _port?.close(); } catch {}
-    _port = null;
+    // Paksa tutup port supaya percubaan seterusnya bermula bersih
+    if (_port) {
+      await _forceClosePort(_port).catch(() => {});
+      _port = null;
+    }
     throw e;
   }
 }
