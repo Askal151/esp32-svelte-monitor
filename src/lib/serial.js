@@ -98,11 +98,32 @@ async function onWatchdogFire() {
 // ── Tutup reader & port dengan selamat ─────────────────────────
 async function _safeClose() {
   stopWatchdog();
+  // Cancel dulu — ini unlock readable stream
   try { await _reader?.cancel(); }  catch {}
   try { _reader?.releaseLock(); }   catch {}
   _reader = null;
-  await delay(100);
+  await delay(150);   // beri masa Chrome release lock
   try { await _port?.close(); }     catch {}
+  await delay(100);
+}
+
+// ── Buka port dengan retry jika port dalam state lama ──────────
+async function _openPort(port) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      await port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
+      return;   // berjaya
+    } catch (e) {
+      console.warn(`[serial] open attempt ${i+1} gagal:`, e.message);
+      if (i < 2) {
+        // Port mungkin masih open — paksa tutup dan cuba lagi
+        try { await port.close(); } catch {}
+        await delay(400 + i * 300);
+      } else {
+        throw new Error('Port tidak boleh dibuka. Reload halaman (Ctrl+Shift+R) dan cuba semula.');
+      }
+    }
+  }
 }
 
 // ── Web Serial USB events ──────────────────────────────────────
@@ -260,11 +281,7 @@ async function _autoReconnect() {
         continue;
       }
       _port = ports[0];
-      // Tutup dulu — port mungkin masih terbuka dalam Chrome
-      try { await _port.close(); } catch {}
-      await delay(500);
-
-      await _port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
+        await _openPort(_port);
       _reader = _port.readable.getReader();
 
       // Tetapkan _running = true DAN _reconnecting = false
@@ -315,14 +332,7 @@ export async function connect() {
 
   try {
     _port = await navigator.serial.requestPort();
-
-    // Port mungkin masih "open" dalam Chrome — cuba tutup dulu
-    if (_port.readable || _port.writable) {
-      try { await _port.close(); } catch {}
-      await delay(300);
-    }
-
-    await _port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
+    await _openPort(_port);
 
     _reader      = _port.readable.getReader();
     _running     = true;
@@ -386,7 +396,7 @@ export async function resumeMonitor() {
   if (!_port) return;
   try {
     await delay(400);
-    await _port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
+    await _openPort(_port);
     _reader      = _port.readable.getReader();
     _running     = true;
     _wantMonitor = true;
@@ -436,3 +446,19 @@ export function downloadCSV() {
 }
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
+
+// ── Vite HMR cleanup — tutup port semasa hot-reload ────────────
+if (import.meta.hot) {
+  import.meta.hot.dispose(async () => {
+    _wantMonitor = false;
+    _running     = false;
+    stopWatchdog();
+    try { await _reader?.cancel(); }  catch {}
+    try { _reader?.releaseLock(); }   catch {}
+    _reader = null;
+    await delay(150);
+    try { await _port?.close(); }     catch {}
+    _port = null;
+    console.log('[serial] HMR dispose — port ditutup');
+  });
+}
