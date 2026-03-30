@@ -1,7 +1,6 @@
 /**
  * serial.js — Web Serial manager untuk ESP32 + ADS1015
  * Format output: HALL4|adc1|dev1|led1|adc2|dev2|led2|adc3|dev3|led3|adc4|dev4|led4  @115200
- * S1=A0, S2=A1, S3=A2, S4=A3
  */
 import { writable } from 'svelte/store';
 
@@ -61,12 +60,14 @@ let _csvRows      = [];
 let _logging      = false;
 let _logCount     = 0;
 let _wantMonitor  = false;
-let _reconnecting = false;
+let _reconnecting = false;   // sedang dalam proses reconnect
+let _failStreak   = 0;       // berapa kali readLoop gagal berturut-turut tanpa data
 let _watchdog     = null;
 
-const WATCHDOG_MS  = 6000;   // 6s tiada data → reconnect
-const BAUD         = 115200;
-const BUF_SIZE     = 65536;  // buffer besar cegah overflow
+const WATCHDOG_MS = 6000;
+const BAUD        = 115200;
+const BUF_SIZE    = 65536;
+const MAX_STREAK  = 3;       // gagal >= MAX_STREAK → minta reconnect manual
 
 isLogging.subscribe(v => { _logging = v; });
 
@@ -85,50 +86,47 @@ function stopWatchdog() {
 
 async function onWatchdogFire() {
   if (!_running || !_wantMonitor || _reconnecting) return;
-  console.warn('[serial] watchdog — tiada data, reconnect...');
+  console.warn('[serial] watchdog — tiada data');
   emitRaw('[WATCHDOG] Tiada data — cuba sambung semula...', 'rx');
-  await _forceReconnect();
-}
-
-// ── Tutup reader & port dengan selamat ─────────────────────────
-async function _closeAll() {
-  stopWatchdog();
   _running = false;
-  try { await _reader?.cancel(); }   catch {}
-  try { _reader?.releaseLock(); }    catch {}
-  _reader = null;
-  await delay(100);
-  try { await _port?.close(); }      catch {}
-}
-
-// ── Force reconnect (tutup dulu, buka semula) ──────────────────
-async function _forceReconnect() {
-  if (_reconnecting) return;    // cegah panggilan berganda
   connected.set(false);
-  await _closeAll();
+  await _safeClose();
   await delay(600);
   await _autoReconnect();
 }
 
+// ── Tutup reader & port dengan selamat ─────────────────────────
+async function _safeClose() {
+  stopWatchdog();
+  try { await _reader?.cancel(); }  catch {}
+  try { _reader?.releaseLock(); }   catch {}
+  _reader = null;
+  await delay(100);
+  try { await _port?.close(); }     catch {}
+}
+
 // ── Web Serial USB events ──────────────────────────────────────
 if (typeof navigator !== 'undefined' && navigator.serial) {
+
   navigator.serial.addEventListener('disconnect', (e) => {
     if (e.target !== _port) return;
     console.log('[serial] USB disconnect event');
     stopWatchdog();
-    _running = false;   // hentikan readLoop — ia akan kesan physicalLoss sendiri
+    _running = false;
     _port    = null;
-    connected.set(false);
-    try { _reader?.cancel(); } catch {}
+    try { _reader?.cancel(); }   catch {}
     try { _reader?.releaseLock(); } catch {}
     _reader = null;
-    emitRaw('[USB] Peranti dicabut — cabut & pasang semula USB...', 'rx');
+    connected.set(false);
+    emitRaw('[USB] Peranti dicabut.', 'rx');
   });
 
   navigator.serial.addEventListener('connect', async () => {
-    if (_wantMonitor && !_running && !_reconnecting) {
-      emitRaw('[USB] Peranti dikesan — reconnecting...', 'rx');
-      await delay(800);
+    // Hanya reconnect jika: user mahu monitor, tiada sesi aktif,
+    // tiada reconnect dalam proses, DAN streak gagal belum melebihi had
+    if (_wantMonitor && !_running && !_reconnecting && _failStreak < MAX_STREAK) {
+      emitRaw('[USB] Peranti dikesan semula — reconnecting...', 'rx');
+      await delay(1200);   // tunggu ESP32 selesai enumerate
       await _autoReconnect();
     }
   });
@@ -147,15 +145,15 @@ function parseLine(raw) {
       for (let i = 0; i < 4; i++) {
         const adc = v[i*3], dev = v[i*3+1], led = v[i*3+2];
         arr[i] = { ...arr[i], adc, volt: +(adc * 0.002).toFixed(3), dev, led };
-        plotBuf[i].adc.push(adc);  plotBuf[i].adc.shift();
-        plotBuf[i].dev.push(dev);  plotBuf[i].dev.shift();
-        plotBuf[i].led.push(led);  plotBuf[i].led.shift();
+        plotBuf[i].adc.push(adc); plotBuf[i].adc.shift();
+        plotBuf[i].dev.push(dev); plotBuf[i].dev.shift();
+        plotBuf[i].led.push(led); plotBuf[i].led.shift();
       }
       return arr;
     });
     packetCount.update(n => n + 1);
     chartTick.update(n => n + 1);
-    resetWatchdog();   // data diterima — reset timer
+    resetWatchdog();
     if (_logging) {
       _csvRows.push([new Date().toISOString().slice(11, 23), ...v].join(','));
       logCount.set(++_logCount);
@@ -180,57 +178,69 @@ function parseLine(raw) {
   }
 }
 
-// ── Kesan error USB hilang fizikal ─────────────────────────────
-function isPhysicalLoss(err) {
-  const msg = err?.message ?? '';
-  return msg.includes('device has been lost') ||
-         msg.includes('The device') ||
-         err?.name === 'NetworkError';
-}
-
 // ── Read loop ──────────────────────────────────────────────────
 async function readLoop() {
   const dec = new TextDecoder();
   _lineBuf = '';
-  let physicalLoss = false;
+  let gotData  = false;   // pernah terima data dalam sesi ini?
+  let lastErr  = null;
   console.log('[serial] readLoop mula');
 
   while (_running) {
     try {
       const { value, done } = await _reader.read();
       if (done) { console.log('[serial] reader done'); break; }
+      if (!gotData) {
+        gotData = true;
+        _failStreak = 0;   // berjaya terima data → reset streak
+      }
       _lineBuf += dec.decode(value, { stream: true });
       const lines = _lineBuf.split('\n');
       _lineBuf = lines.pop() ?? '';
       for (const l of lines) parseLine(l);
     } catch (err) {
+      lastErr = err;
       console.warn('[serial] read error:', err.message);
-      physicalLoss = isPhysicalLoss(err);
       break;
     }
   }
 
   console.log('[serial] readLoop berhenti');
   stopWatchdog();
+  try { _reader?.releaseLock(); } catch {}
+  _reader = null;
 
-  if (physicalLoss) {
-    // USB hilang fizikal — bersih sahaja, JANGAN reconnect sekarang
-    // Tunggu navigator.serial 'connect' event untuk reconnect
-    _running = false;
-    _port    = null;
-    connected.set(false);
-    try { _reader?.releaseLock(); } catch {}
-    _reader = null;
-    emitRaw('[USB] Peranti hilang — cabut & pasang semula USB...', 'rx');
+  // _running = false bermakna disconnect() atau USB event yang hentikan loop
+  // → jangan reconnect, keluar sahaja
+  if (!_running) return;
+
+  _running = false;
+  connected.set(false);
+
+  if (!_wantMonitor) return;
+
+  if (!gotData) {
+    // readLoop gagal tanpa dapat sebarang data (kemungkinan USB tidak stabil)
+    _failStreak++;
+    _port = null;
+    if (_failStreak >= MAX_STREAK) {
+      // Terlalu banyak kali gagal → berhenti, minta user reconnect manual
+      _wantMonitor = false;
+      portState.set('idle');
+      emitRaw(`[USB] Gagal ${_failStreak}x berturut — klik ⚡ Sambung semula`, 'rx');
+    } else {
+      emitRaw(`[USB] Sambungan tidak stabil (${_failStreak}/${MAX_STREAK}) — menunggu USB...`, 'rx');
+      // Tunggu 'connect' event — JANGAN reconnect terus
+    }
     return;
   }
 
-  // Putus tidak sengaja (bukan USB hilang) — boleh cuba reconnect
-  if (_running && _wantMonitor && !_reconnecting) {
-    _running = false;
-    connected.set(false);
-    emitRaw('[SISTEM] Sambungan hilang — cuba pulihkan...', 'rx');
-    await _forceReconnect();
+  // Ada data tapi kemudian putus → ini genuine disconnect, cuba reconnect
+  emitRaw('[SISTEM] Sambungan hilang — cuba pulihkan...', 'rx');
+  if (!_reconnecting) {
+    try { await _port?.close(); } catch {}
+    await delay(800);
+    await _autoReconnect();
   }
 }
 
@@ -240,43 +250,46 @@ async function _autoReconnect() {
   _reconnecting = true;
   portState.set('idle');
 
-  for (let attempt = 1; attempt <= 12; attempt++) {
+  for (let attempt = 1; attempt <= 10; attempt++) {
     if (!_wantMonitor) break;
     try {
       const ports = await navigator.serial.getPorts();
       if (!ports.length) {
-        emitRaw(`[USB] Tiada port tersedia... (${attempt}/12)`, 'rx');
+        emitRaw(`[USB] Tiada port... (${attempt}/10)`, 'rx');
         await delay(1000);
         continue;
       }
       _port = ports[0];
-
-      // Pastikan port tertutup — jangan assume state
       try { await _port.close(); } catch {}
-      await delay(300);
+      await delay(400);
 
       await _port.open({ baudRate: BAUD, bufferSize: BUF_SIZE });
-      _reader  = _port.readable.getReader();
-      _running = true;
+      _reader = _port.readable.getReader();
+
+      // Tetapkan _running = true DAN _reconnecting = false
+      // SEBELUM readLoop dipanggil — tapi dengan urutan yang betul:
+      // readLoop mesti tahu ia sudah "dalam reconnect" sehingga data pertama diterima
       connected.set(true);
       portState.set('monitor');
       emitRaw(`[USB] Sambungan dipulihkan ✓ (percubaan ${attempt})`, 'rx');
       console.log('[serial] reconnect berjaya (attempt', attempt, ')');
-      _reconnecting = false;
+
+      _running      = true;
+      _reconnecting = false;   // clear SELEPAS _running = true
       resetWatchdog();
-      readLoop();
+      readLoop();              // fire-and-forget (intentional)
       return;
     } catch (e) {
       console.warn(`[serial] reconnect ${attempt} gagal:`, e.message);
-      await delay(Math.min(1000 * attempt, 5000));   // backoff
+      await delay(Math.min(1000 * attempt, 5000));
     }
   }
 
   _reconnecting = false;
   _wantMonitor  = false;
   _port = null;
-  emitRaw('[SISTEM] Reconnect gagal — klik ⚡ Sambung semula', 'rx');
   portState.set('idle');
+  emitRaw('[SISTEM] Reconnect gagal — klik ⚡ Sambung semula', 'rx');
 }
 
 // ── API awam ───────────────────────────────────────────────────
@@ -287,9 +300,14 @@ export async function connect() {
     return false;
   }
 
-  // Bersihkan sambungan lama dulu
+  // Reset state
+  _failStreak   = 0;
+  _reconnecting = false;
+
+  // Bersihkan sesi lama
   if (_running || _port) {
-    await _closeAll();
+    _running = false;
+    await _safeClose();
     _port = null;
     await delay(200);
   }
@@ -315,7 +333,10 @@ export async function connect() {
 
 export async function disconnect() {
   _wantMonitor = false;
-  await _closeAll();
+  _running     = false;
+  _failStreak  = 0;
+  stopWatchdog();
+  await _safeClose();
   _port = null;
   connected.set(false);
   portState.set('idle');
@@ -339,7 +360,9 @@ export async function sendCmd(cmd) {
 export async function prepareForFlash() {
   if (!navigator.serial) throw new Error('Web Serial API tidak disokong.');
   _wantMonitor = false;
-  await _closeAll();
+  _running     = false;
+  stopWatchdog();
+  await _safeClose();
   if (!_port) {
     _port = await navigator.serial.requestPort();
   }
@@ -357,6 +380,7 @@ export async function resumeMonitor() {
     _reader      = _port.readable.getReader();
     _running     = true;
     _wantMonitor = true;
+    _failStreak  = 0;
     connected.set(true);
     portState.set('monitor');
     resetWatchdog();
@@ -370,6 +394,8 @@ export async function resumeMonitor() {
 
 export function forgetPort() {
   _wantMonitor = false;
+  _running     = false;
+  _failStreak  = 0;
   stopWatchdog();
   _port = null;
   portState.set('idle');
