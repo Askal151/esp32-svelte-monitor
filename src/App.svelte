@@ -17,7 +17,7 @@
     catch(e) { lastError = e.message; }
   }
 
-  const CLR = ['#22d3ee', '#4ade80'];
+  const CLR = ['#22d3ee', '#4ade80', '#f59e0b', '#f472b6'];
 
   let tab = 'monitor';   // monitor | flash | plotter
 
@@ -90,7 +90,7 @@
   {/if}
 
   <!-- ── SENSOR CARDS ────────────────────────────────── -->
-  <section class="grid grid-cols-2 gap-3 max-sm:grid-cols-1">
+  <section class="grid grid-cols-2 lg:grid-cols-4 gap-3 max-sm:grid-cols-1">
     {#each $sensors as s, i}
       <SensorCard sensor={s} idx={i} color={CLR[i]} />
     {/each}

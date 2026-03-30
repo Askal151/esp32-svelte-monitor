@@ -1,21 +1,24 @@
 <!--
   Plotter.svelte — Canvas 2D real-time plotter, 60fps
-  3 panel: ADC, Deviasi, LED — kedua sensor serentak
+  3 panel: ADC, Deviasi, LED — 4 sensor serentak
 -->
 <script>
   import { onMount, tick } from 'svelte';
   import { plotBuf, chartTick, sensors, MAX_POINTS } from './serial.js';
 
-  const CLR  = ['#22d3ee', '#4ade80'];
+  const CLR  = ['#22d3ee', '#4ade80', '#f59e0b', '#f472b6'];
   const TCLR = ['#fbbf24', '#f97316', '#ef4444', '#a855f7'];
+
+  const NUM_SENSORS = 4;
 
   let wrap, canvas, ctx;
   let rafId, dirty = true, paused = false;
   let W = 0, H = 0;
 
-  // state sensor (reactive)
-  let sens0 = { adc: 0, dev: 0, led: 0, baseline: 0, thresh: [82, 329, 720, 1049] };
-  let sens1 = { adc: 0, dev: 0, led: 0, baseline: 0, thresh: [82, 329, 720, 1049] };
+  // state sensor (reactive) — array 4 sensor
+  let sensArr = Array.from({ length: NUM_SENSORS }, () =>
+    ({ adc: 0, dev: 0, led: 0, baseline: 0, thresh: [82, 329, 720, 1049] })
+  );
 
   // Panel layout — dikira semula tiap resize
   // P[i] = { y, h, label, min, max }
@@ -45,18 +48,17 @@
     const pw = x1 - x0, ph = y1 - y0;
     if (pw <= 0 || ph <= 0) return;
 
-    const buf0 = plotBuf[0][key];
-    const buf1 = plotBuf[1][key];
+    const bufs = plotBuf.map(b => b[key]);
 
     // Hitung range Y
     let vMin, vMax;
     if (autoY) {
       vMin = Infinity; vMax = -Infinity;
-      for (let i = 0; i < MAX_POINTS; i++) {
-        if (buf0[i] < vMin) vMin = buf0[i];
-        if (buf0[i] > vMax) vMax = buf0[i];
-        if (buf1[i] < vMin) vMin = buf1[i];
-        if (buf1[i] > vMax) vMax = buf1[i];
+      for (let si = 0; si < NUM_SENSORS; si++) {
+        for (let i = 0; i < MAX_POINTS; i++) {
+          if (bufs[si][i] < vMin) vMin = bufs[si][i];
+          if (bufs[si][i] > vMax) vMax = bufs[si][i];
+        }
       }
       if (vMin === vMax) { vMin -= 10; vMax += 10; }
       const margin = (vMax - vMin) * 0.08;
@@ -88,7 +90,7 @@
 
     // Threshold lines (panel deviasi)
     if (key === 'dev') {
-      const thresh = sens0.thresh ?? [];
+      const thresh = sensArr[0].thresh ?? [];
       for (let i = 0; i < thresh.length; i++) {
         const ty = toY(thresh[i]);
         if (ty >= y0 && ty <= y1) {
@@ -106,8 +108,8 @@
 
     // Baseline line (panel ADC)
     if (key === 'adc') {
-      for (let si = 0; si < 2; si++) {
-        const base = si === 0 ? sens0.baseline : sens1.baseline;
+      for (let si = 0; si < NUM_SENSORS; si++) {
+        const base = sensArr[si].baseline;
         if (!base) continue;
         const by = toY(base);
         if (by >= y0 && by <= y1) {
@@ -124,35 +126,33 @@
     const step = pw / (MAX_POINTS - 1);
 
     if (key === 'led') {
-      // Bar chart untuk LED
-      const barW = Math.max(1, step * 0.45);
-      for (let si = 0; si < 2; si++) {
-        const buf = si === 0 ? buf0 : buf1;
-        const offset = si === 0 ? -barW * 0.55 : barW * 0.15;
+      // Bar chart untuk LED — 4 sensor
+      const barW = Math.max(1, step * 0.22);
+      const offsets = [-barW * 1.65, -barW * 0.55, barW * 0.55, barW * 1.65];
+      for (let si = 0; si < NUM_SENSORS; si++) {
         ctx.fillStyle = CLR[si] + '90';
         for (let i = 0; i < MAX_POINTS; i++) {
-          const bx = x0 + i * step + offset;
-          const bv = buf[i];
+          const bx = x0 + i * step + offsets[si];
+          const bv = bufs[si][i];
           const by = toY(bv);
           const bh = y1 - by;
           if (bh > 0) ctx.fillRect(bx, by, barW, bh);
         }
       }
     } else {
-      // Line chart
-      for (let si = 0; si < 2; si++) {
-        const buf = si === 0 ? buf0 : buf1;
+      // Line chart — 4 sensor
+      for (let si = 0; si < NUM_SENSORS; si++) {
         // Fill area
         ctx.beginPath();
         ctx.moveTo(x0, y1);
         for (let i = 0; i < MAX_POINTS; i++) {
           const px = x0 + i * step;
-          const py = Math.max(y0, Math.min(y1, toY(buf[i])));
+          const py = Math.max(y0, Math.min(y1, toY(bufs[si][i])));
           i === 0 ? ctx.lineTo(px, py) : ctx.lineTo(px, py);
         }
         ctx.lineTo(x0 + (MAX_POINTS - 1) * step, y1);
         ctx.closePath();
-        ctx.fillStyle = CLR[si] + '18';
+        ctx.fillStyle = CLR[si] + '14';
         ctx.fill();
 
         // Line
@@ -162,7 +162,7 @@
         ctx.lineJoin = 'round';
         for (let i = 0; i < MAX_POINTS; i++) {
           const px = x0 + i * step;
-          const py = Math.max(y0, Math.min(y1, toY(buf[i])));
+          const py = Math.max(y0, Math.min(y1, toY(bufs[si][i])));
           i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
         }
         ctx.stroke();
@@ -191,19 +191,18 @@
     ctx.fillStyle = '#0f172a';
     ctx.fillRect(0, 0, W, HEADER);
 
-    // Legend sensor di header
-    for (let i = 0; i < 2; i++) {
-      const s = i === 0 ? sens0 : sens1;
-      const lx = 10 + i * Math.floor((W - 20) / 2);
-      // Dot
+    // Legend sensor di header — 4 sensor
+    for (let i = 0; i < NUM_SENSORS; i++) {
+      const s = sensArr[i];
+      const lx = 10 + i * Math.floor((W - 20) / NUM_SENSORS);
       ctx.fillStyle = CLR[i];
-      ctx.beginPath(); ctx.arc(lx + 5, HEADER / 2, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(lx + 5, HEADER / 2, 4, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = CLR[i];
-      ctx.font = 'bold 11px monospace';
+      ctx.font = 'bold 10px monospace';
       ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
       ctx.fillText(
-        `S${i + 1}  ADC:${s.adc}  Dev:${s.dev}  LED:${s.led}`,
-        lx + 14, HEADER / 2
+        `S${i + 1} ${s.adc} D:${s.dev} L:${s.led}`,
+        lx + 13, HEADER / 2
       );
     }
 
@@ -248,8 +247,7 @@
 
     // Subscribe sensor state
     const unsubS = sensors.subscribe(arr => {
-      sens0 = { ...arr[0] };
-      sens1 = { ...arr[1] };
+      sensArr = arr.map(s => ({ ...s }));
       dirty = true;
     });
 
@@ -288,9 +286,9 @@
   <div class="flex items-center gap-3 px-3 py-1.5 bg-slate-900 border-b border-slate-800 shrink-0">
     <span class="text-xs font-bold tracking-widest text-slate-600">PLOTTER</span>
     <div class="flex items-center gap-1.5 ml-1">
-      {#each [0,1] as i}
+      {#each [0,1,2,3] as i}
         <div class="w-2.5 h-2.5 rounded-full" style="background:{CLR[i]}"></div>
-        <span class="text-xs font-mono mr-3" style="color:{CLR[i]}">S{i+1}</span>
+        <span class="text-xs font-mono mr-2" style="color:{CLR[i]}">S{i+1}</span>
       {/each}
     </div>
     <span class="text-xs text-slate-700 flex-1">{MAX_POINTS} titik bergulir · 60fps</span>
